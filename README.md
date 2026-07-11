@@ -39,7 +39,8 @@ line in the stack" (i.e. your normal password prompt).
 
 
 ## Install
-curl -fsSL https://raw.githubusercontent.com/minerofthesoal/facegate/main/get.sh | bash
+```curl -fsSL https://raw.githubusercontent.com/minerofthesoal/facegate/main/get.sh | bash```
+
 or
 
 ```bash
