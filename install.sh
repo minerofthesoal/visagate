@@ -46,6 +46,11 @@ main()
 EOF
 chmod 755 /usr/bin/facegate-auth
 
+echo "== Creating log directory =="
+mkdir -p /var/log/facegate
+chmod 750 /var/log/facegate
+
 echo ""
-echo "Install complete."
+echo "Install complete (facegate $(python3 -c "import sys; sys.path.insert(0,'/usr/lib/facegate'); from facegate import __version__; print(__version__)"))."
 echo "Run:  sudo facegate autosetup"
+echo "Then: sudo facegate doctor    (sanity-check camera + PAM wiring)"

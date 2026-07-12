@@ -7,7 +7,7 @@ import shutil
 import sys
 import time
 
-from . import camera, config, recognizer, security
+from . import __version__, camera, config, recognizer, security
 
 PAM_MARKER = "facegate-auth"
 PAM_LINE = f"auth    sufficient   pam_exec.so quiet /usr/bin/{PAM_MARKER}\n"
@@ -18,11 +18,34 @@ PAM_LINE = f"auth    sufficient   pam_exec.so quiet /usr/bin/{PAM_MARKER}\n"
 # /etc/pam.d/<service> if present, otherwise falls back to the vendor copy.
 # To add our line we need a real file under /etc/pam.d/, so if only the
 # vendor copy exists we seed /etc/pam.d/<service> from it first.
+#
+# v0.2.0: added sddm (the login-manager screen you hit right after a
+# restart) and kscreenlocker-greet (the PAM service name Plasma's lock
+# screen uses on some distros/versions, alongside the older "kde" name --
+# both are wired since which one is actually in play varies, and wiring
+# a service whose file doesn't exist on your system is a safe no-op).
 PAM_TARGETS = {
     "/etc/pam.d/sudo": None,
     "/etc/pam.d/login": None,
-    "/etc/pam.d/kde": "/usr/lib/pam.d/kde",  # KDE Plasma's kscreenlocker (kcheckpass)
+    "/etc/pam.d/kde": "/usr/lib/pam.d/kde",  # KDE Plasma's kscreenlocker (kcheckpass), older naming
+    "/etc/pam.d/kscreenlocker-greet": "/usr/lib/pam.d/kscreenlocker-greet",  # same, newer naming
+    "/etc/pam.d/sddm": "/usr/lib/pam.d/sddm",  # SDDM login screen, i.e. right after a restart
 }
+
+GREETER_SERVICES = {"sddm", "sddm-greeter", "kde", "kde-np", "kscreenlocker-greet"}
+
+
+def detect_display_manager():
+    """Best-effort name of the active display manager (sddm/gdm/lightdm/...),
+    via the systemd display-manager.service symlink. Informational only --
+    used to tell the user which lock-screen PAM file is actually relevant
+    to them, not to gate anything. New in v0.2.0."""
+    try:
+        target = os.path.realpath("/etc/systemd/system/display-manager.service")
+        name = os.path.basename(target).replace(".service", "")
+        return name or None
+    except OSError:
+        return None
 
 
 def require_root():
@@ -34,7 +57,9 @@ def require_root():
 def cmd_autosetup(args):
     require_root()
     print("== FaceGate autosetup ==")
-    print("Scanning for Logitech Brio camera devices (v4l2-ctl)...")
+    dm = detect_display_manager()
+    print(f"Detected display manager: {dm or 'unknown'}")
+    print("Scanning for Logitech camera devices (v4l2-ctl)...")
     rgb, ir, all_devs = camera.auto_detect()
 
     if not all_devs:
@@ -225,6 +250,7 @@ def cmd_enable(args):
     require_root()
     security.ensure_verify_service()
     _install_pam(interactive=True)
+    security.clear_lockout()
     cfg = config.load()
     cfg["enabled"] = True
     config.save(cfg)
@@ -393,11 +419,91 @@ def cmd_uninstall(args):
     print(f"Face model files are still in {config.MODEL_DIR} -- delete manually if you want them gone too.")
 
 
+def cmd_doctor(args):
+    """Health check: camera, PAM wiring, enrolled models, lockout state,
+    logging. New in v0.2.0."""
+    require_root()
+    from . import logging_setup
+
+    print("== FaceGate doctor ==")
+    ok_all = True
+
+    def check(label, ok, detail=""):
+        nonlocal ok_all
+        mark = "OK  " if ok else "FAIL"
+        print(f"[{mark}] {label}" + (f" -- {detail}" if detail else ""))
+        if not ok:
+            ok_all = False
+
+    cfg = config.load()
+    check("face unlock enabled", cfg.get("enabled"), "" if cfg.get("enabled") else "run 'sudo facegate enable'")
+
+    dm = detect_display_manager()
+    print(f"     display manager: {dm or 'unknown'}")
+
+    devs = camera.list_video_devices()
+    logi = sorted({d for d, desc in devs.items() if desc and "logitech" in desc.lower()})
+    check("Logitech camera(s) detected", bool(logi), ", ".join(logi) if logi else "none found via v4l2-ctl")
+
+    rgb = cfg["camera"].get("rgb_device")
+    ir = cfg["camera"].get("ir_device")
+    check("RGB device configured", bool(rgb), rgb or "none -- run 'sudo facegate autosetup'")
+    check("IR device configured", bool(ir), ir or "none (RGB-only mode -- fine if your webcam has no IR sensor)")
+
+    username = os.environ.get("SUDO_USER") or getpass.getuser()
+    rgb_model = os.path.join(config.MODEL_DIR, f"{username}_rgb.yml")
+    ir_model = os.path.join(config.MODEL_DIR, f"{username}_ir.yml")
+    if rgb:
+        check(f"RGB model enrolled ({username})", os.path.exists(rgb_model))
+    if ir:
+        check(f"IR model enrolled ({username})", os.path.exists(ir_model))
+
+    for pam_file in PAM_TARGETS:
+        if not os.path.exists(pam_file):
+            print(f"[skip] PAM file not present: {pam_file} (not applicable on this system)")
+            continue
+        with open(pam_file) as f:
+            wired = PAM_MARKER in f.read()
+        check(f"PAM wired: {pam_file}", wired)
+
+    locked, remaining = security.is_locked_out()
+    check("not currently locked out", not locked, f"{remaining}s remaining" if locked else "")
+
+    try:
+        os.makedirs(logging_setup.LOG_DIR, exist_ok=True)
+        check("log directory writable", os.access(logging_setup.LOG_DIR, os.W_OK))
+    except PermissionError:
+        check("log directory writable", False)
+
+    print("\nAll checks passed." if ok_all else "\nSome checks failed -- see above.")
+
+
+def cmd_log(args):
+    """Show recent auth attempts from the FaceGate log file. New in v0.2.0."""
+    from . import logging_setup
+
+    try:
+        with open(logging_setup.LOG_FILE) as f:
+            lines = f.readlines()[-args.n :]
+    except FileNotFoundError:
+        print(f"No log file yet at {logging_setup.LOG_FILE}.")
+        print("Either nothing has run through PAM yet, or you're on syslog-only:")
+        print("  sudo journalctl -t facegate -e")
+        return
+    except PermissionError:
+        print(f"Permission denied reading {logging_setup.LOG_FILE} -- try with sudo.")
+        return
+    for line in lines:
+        print(line.rstrip())
+
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="facegate",
-        description="Face unlock for Logitech Brio webcams on Arch Linux (Howdy-style, RGB+IR).",
+        description="Face unlock for Logitech webcams on Arch Linux (Howdy-style, RGB+IR where available).",
     )
+    parser.add_argument("--version", action="version", version=f"facegate {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("autosetup", help="Detect camera, enroll your face, wire up PAM").set_defaults(
@@ -447,6 +553,14 @@ def main():
     p.set_defaults(func=cmd_relax)
 
     sub.add_parser("uninstall", help="Remove PAM integration").set_defaults(func=cmd_uninstall)
+
+    sub.add_parser(
+        "doctor", help="Run health checks: camera, PAM wiring, enrolled models, lockout, logs"
+    ).set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("log", help="Show recent auth attempts from the FaceGate log")
+    p.add_argument("-n", type=int, default=20, help="number of lines to show (default 20)")
+    p.set_defaults(func=cmd_log)
 
     args = parser.parse_args()
     args.func(args)

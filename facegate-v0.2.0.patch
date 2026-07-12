@@ -1,0 +1,844 @@
+diff -ruN '--exclude=.git' a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md	1970-01-01 00:00:00.000000000 +0000
++++ b/CHANGELOG.md	2026-07-12 04:25:26.655458652 +0000
+@@ -0,0 +1,59 @@
++# Changelog
++
++## v0.2.0
++
++**Broader webcam support**
++- Detection no longer assumes "Brio" specifically -- any Logitech device
++  is probed, same as before, but classification is now backed by a known
++  IR-capable/non-IR-capable model table (Brio 4K/500/505/MX Brio vs.
++  Brio 300/100, C920/C922/C930/C925, StreamCam, BCC950, etc.) instead of
++  relying purely on the saturation heuristic, which could misclassify a
++  dim RGB feed as IR on hardware that never had an IR sensor. Unknown
++  models still fall back to the saturation probe as before.
++
++**Lock screen / login screen**
++- Added `/etc/pam.d/sddm` as a PAM target -- this is the login screen you
++  hit right after a restart, previously not wired at all.
++- Added `/etc/pam.d/kscreenlocker-greet` alongside the existing `kde`
++  target, since Plasma's lock screen uses different PAM service names
++  across distros/versions -- both are wired (safe no-op if a given file
++  doesn't apply to your system).
++- New `recognition.timeout_seconds_greeter` (default 6s), used instead of
++  the sudo-context `timeout_seconds` for greeter/lock-screen PAM
++  services, so the lock screen doesn't sit unresponsive for the full
++  sudo-context budget.
++- Added a camera-busy guard (flock) so a lock screen and a sudo prompt
++  triggering face checks at the same moment don't collide on the video
++  device.
++- Added a boot-readiness retry (`camera_wait_seconds`, default 5s) so a
++  USB webcam that hasn't enumerated yet right after a cold boot gets a
++  few seconds' grace instead of failing closed on the first try.
++
++**Security**
++- New lockout/cooldown: after `lockout.max_failed_attempts` (default 5)
++  consecutive failures, face auth is skipped for `lockout.cooldown_seconds`
++  (default 300s) and PAM falls straight to password. State lives on
++  tmpfs (`/run/facegate`) and resets on reboot. `sudo facegate enable`
++  clears any active cooldown.
++
++**Logging**
++- New `facegate/logging_setup.py`: auth attempts are now written to
++  `/var/log/facegate/facegate.log` (rotating, 5x2MB) in addition to
++  syslog, and `facegate log` shows recent entries directly without
++  needing `journalctl` syntax.
++
++**New commands**
++- `facegate doctor` -- one-shot health check: camera detected, RGB/IR
++  configured, models enrolled, PAM wiring, lockout state, log dir.
++- `facegate log [-n N]` -- show recent auth attempts.
++- `facegate --version`.
++- `autosetup`/`enable` now print the detected display manager.
++
++**Known limitation, stated honestly:** the lock-screen/login-screen PAM
++wiring above targets the PAM service names these greeters *should* use;
++whether `pam_exec` actually fires cleanly from a given greeter still
++depends on your specific Plasma/SDDM version and distro packaging, and
++isn't something that can be verified without testing on the target
++machine. Run `sudo facegate doctor` after `enable`, then test an actual
++lock/restart cycle and check `sudo facegate log` / `sudo journalctl -t
++facegate -e` if it doesn't fire.
+diff -ruN '--exclude=.git' a/PKGBUILD b/PKGBUILD
+--- a/PKGBUILD	2026-07-12 04:25:05.988285644 +0000
++++ b/PKGBUILD	2026-07-12 04:25:26.659147145 +0000
+@@ -1,8 +1,8 @@
+ # Maintainer: Ray0rf1re
+ pkgname=facegate
+-pkgver=0.1.1
++pkgver=0.2.0
+ pkgrel=1
+-pkgdesc="Face unlock (RGB+IR) for Logitech Brio webcams via PAM, Howdy-style"
++pkgdesc="Face unlock (RGB+IR) for Logitech webcams via PAM, Howdy-style"
+ arch=('any')
+ url="https://github.com/minerofthesoal/facegate"
+ license=('MIT')
+diff -ruN '--exclude=.git' a/facegate/__init__.py b/facegate/__init__.py
+--- a/facegate/__init__.py	2026-07-12 04:25:05.988285644 +0000
++++ b/facegate/__init__.py	2026-07-12 04:25:26.634728516 +0000
+@@ -1,3 +1,3 @@
+ """FaceGate - a Howdy-style face unlock utility for Logitech Brio webcams on Arch Linux."""
+ 
+-__version__ = "0.1.0"
++__version__ = "0.2.0"
+diff -ruN '--exclude=.git' a/facegate/camera.py b/facegate/camera.py
+--- a/facegate/camera.py	2026-07-12 04:25:05.988980959 +0000
++++ b/facegate/camera.py	2026-07-12 04:25:26.636819648 +0000
+@@ -1,16 +1,72 @@
+-"""Camera discovery for the Logitech Brio.
++"""Camera discovery for Logitech webcams.
+ 
+-The Brio (and similar Windows-Hello-capable webcams) expose more than one
+-/dev/videoN node: typically an RGB stream and, on IR-capable units, a
+-monochrome IR stream. We enumerate nodes via `v4l2-ctl --list-devices`,
+-filter to ones whose description mentions Logitech/Brio, then probe each
+-by grabbing a few live frames and looking at color saturation -- IR
+-streams read back as near-grayscale even though the device may still
+-report a color pixel format.
++We enumerate /dev/videoN nodes via `v4l2-ctl --list-devices`, filter to
++ones whose description mentions Logitech, then probe each by grabbing a
++few live frames and looking at color saturation -- IR streams read back
++as near-grayscale even though the device may still report a color pixel
++format.
++
++v0.2.0: broadened beyond the Brio specifically. Not every Logitech webcam
++has an IR sensor at all (most don't -- only the Windows-Hello-capable
++ones do), and running the saturation heuristic against a plain RGB-only
++webcam in dim lighting can misclassify its normal feed as "IR". A small
++known-device table below short-circuits that for common models we can
++name with confidence; anything not in the table still falls back to the
++saturation probe, same as before, so unlisted/future models keep working.
+ """
+ import subprocess
++import time
++
+ import cv2
+ 
++# Substring (lowercase) -> whether this Logitech model is known to expose
++# a second IR stream. Checked against the v4l2-ctl description. Order
++# matters: more specific entries are checked before the generic "brio"
++# catch-all so e.g. "Brio 300" (no IR) isn't swept up by "brio" (usually
++# IR-capable). This list is necessarily incomplete -- anything not
++# matched here falls through to the saturation probe as before.
++KNOWN_NOT_IR_CAPABLE = (
++    "brio 300",
++    "brio 100",
++    "c920",
++    "c922",
++    "c930",
++    "c925",
++    "streamcam",
++    "bcc950",
++    "b910",
++    "b525",
++    "c615",
++    "c270",
++    "rally",
++)
++KNOWN_IR_CAPABLE = (
++    "mx brio",
++    "brio 500",
++    "brio 505",
++    "brio 4k",
++    "brio ultra hd",
++)
++
++
++def classify_known_device(description):
++    """Return True/False if `description` matches a known model, else None
++    (unknown -- caller should fall back to probing)."""
++    if not description:
++        return None
++    desc = description.lower()
++    for sub in KNOWN_NOT_IR_CAPABLE:
++        if sub in desc:
++            return False
++    for sub in KNOWN_IR_CAPABLE:
++        if sub in desc:
++            return True
++    if "brio" in desc:
++        # Bare "Brio" with no model suffix is almost always the original
++        # 4K Ultra HD Pro Webcam, which has IR.
++        return True
++    return None
++
+ 
+ def list_video_devices():
+     """Return {device_path: description} for all v4l2 devices on the system."""
+@@ -31,7 +87,12 @@
+ 
+ 
+ def find_brio_devices():
+-    """Return sorted list of /dev/videoN paths belonging to a Logitech/Brio device."""
++    """Return sorted list of /dev/videoN paths belonging to any Logitech device.
++
++    Name kept for compatibility with older configs/scripts that import it;
++    despite the name this has always matched any Logitech description, not
++    just Brio specifically.
++    """
+     devs = list_video_devices()
+     matches = [
+         d
+@@ -41,6 +102,22 @@
+     return sorted(matches)
+ 
+ 
++def wait_for_devices(timeout=5, interval=0.5):
++    """Poll for Logitech devices to appear, up to `timeout` seconds.
++
++    USB webcams -- especially behind a hub or on a cold boot -- don't
++    always enumerate the instant a PAM check runs, most visibly right at
++    the SDDM login screen right after startup. Returns the device list
++    (possibly empty if none showed up in time). New in v0.2.0.
++    """
++    deadline = time.time() + timeout
++    devices = find_brio_devices()
++    while not devices and time.time() < deadline:
++        time.sleep(interval)
++        devices = find_brio_devices()
++    return devices
++
++
+ def probe_device(path, samples=5):
+     """Open a device, grab a few frames, return resolution + an IR guess."""
+     cap = cv2.VideoCapture(path, cv2.CAP_V4L2)
+@@ -72,13 +149,29 @@
+ 
+ 
+ def auto_detect():
+-    """Return (rgb_info_or_None, ir_info_or_None, all_probed_devices)."""
++    """Return (rgb_info_or_None, ir_info_or_None, all_probed_devices).
++
++    v0.2.0: if every candidate device belongs to a model we know for a
++    fact has no IR sensor (KNOWN_NOT_IR_CAPABLE), we skip the saturation
++    guesswork entirely and just report RGB -- avoids misclassifying a
++    dim-lit RGB feed as an IR stream on hardware that was never going to
++    have one.
++    """
++    devs = list_video_devices()
+     candidates = find_brio_devices()
+     results = []
+     for path in candidates:
+         info = probe_device(path)
+-        if info:
+-            results.append(info)
++        if not info:
++            continue
++        known = classify_known_device(devs.get(path))
++        if known is not None:
++            info["is_ir"] = known
++            info["classified_by"] = "known_device_table"
++        else:
++            info["classified_by"] = "saturation_probe"
++        results.append(info)
+     rgb = next((r for r in results if not r["is_ir"]), None)
+     ir = next((r for r in results if r["is_ir"]), None)
+     return rgb, ir, results
++
+diff -ruN '--exclude=.git' a/facegate/cli.py b/facegate/cli.py
+--- a/facegate/cli.py	2026-07-12 04:25:05.988980959 +0000
++++ b/facegate/cli.py	2026-07-12 04:25:26.638707188 +0000
+@@ -7,7 +7,7 @@
+ import sys
+ import time
+ 
+-from . import camera, config, recognizer, security
++from . import __version__, camera, config, recognizer, security
+ 
+ PAM_MARKER = "facegate-auth"
+ PAM_LINE = f"auth    sufficient   pam_exec.so quiet /usr/bin/{PAM_MARKER}\n"
+@@ -18,12 +18,35 @@
+ # /etc/pam.d/<service> if present, otherwise falls back to the vendor copy.
+ # To add our line we need a real file under /etc/pam.d/, so if only the
+ # vendor copy exists we seed /etc/pam.d/<service> from it first.
++#
++# v0.2.0: added sddm (the login-manager screen you hit right after a
++# restart) and kscreenlocker-greet (the PAM service name Plasma's lock
++# screen uses on some distros/versions, alongside the older "kde" name --
++# both are wired since which one is actually in play varies, and wiring
++# a service whose file doesn't exist on your system is a safe no-op).
+ PAM_TARGETS = {
+     "/etc/pam.d/sudo": None,
+     "/etc/pam.d/login": None,
+-    "/etc/pam.d/kde": "/usr/lib/pam.d/kde",  # KDE Plasma's kscreenlocker (kcheckpass)
++    "/etc/pam.d/kde": "/usr/lib/pam.d/kde",  # KDE Plasma's kscreenlocker (kcheckpass), older naming
++    "/etc/pam.d/kscreenlocker-greet": "/usr/lib/pam.d/kscreenlocker-greet",  # same, newer naming
++    "/etc/pam.d/sddm": "/usr/lib/pam.d/sddm",  # SDDM login screen, i.e. right after a restart
+ }
+ 
++GREETER_SERVICES = {"sddm", "sddm-greeter", "kde", "kde-np", "kscreenlocker-greet"}
++
++
++def detect_display_manager():
++    """Best-effort name of the active display manager (sddm/gdm/lightdm/...),
++    via the systemd display-manager.service symlink. Informational only --
++    used to tell the user which lock-screen PAM file is actually relevant
++    to them, not to gate anything. New in v0.2.0."""
++    try:
++        target = os.path.realpath("/etc/systemd/system/display-manager.service")
++        name = os.path.basename(target).replace(".service", "")
++        return name or None
++    except OSError:
++        return None
++
+ 
+ def require_root():
+     if os.geteuid() != 0:
+@@ -34,7 +57,9 @@
+ def cmd_autosetup(args):
+     require_root()
+     print("== FaceGate autosetup ==")
+-    print("Scanning for Logitech Brio camera devices (v4l2-ctl)...")
++    dm = detect_display_manager()
++    print(f"Detected display manager: {dm or 'unknown'}")
++    print("Scanning for Logitech camera devices (v4l2-ctl)...")
+     rgb, ir, all_devs = camera.auto_detect()
+ 
+     if not all_devs:
+@@ -225,6 +250,7 @@
+     require_root()
+     security.ensure_verify_service()
+     _install_pam(interactive=True)
++    security.clear_lockout()
+     cfg = config.load()
+     cfg["enabled"] = True
+     config.save(cfg)
+@@ -393,11 +419,91 @@
+     print(f"Face model files are still in {config.MODEL_DIR} -- delete manually if you want them gone too.")
+ 
+ 
++def cmd_doctor(args):
++    """Health check: camera, PAM wiring, enrolled models, lockout state,
++    logging. New in v0.2.0."""
++    require_root()
++    from . import logging_setup
++
++    print("== FaceGate doctor ==")
++    ok_all = True
++
++    def check(label, ok, detail=""):
++        nonlocal ok_all
++        mark = "OK  " if ok else "FAIL"
++        print(f"[{mark}] {label}" + (f" -- {detail}" if detail else ""))
++        if not ok:
++            ok_all = False
++
++    cfg = config.load()
++    check("face unlock enabled", cfg.get("enabled"), "" if cfg.get("enabled") else "run 'sudo facegate enable'")
++
++    dm = detect_display_manager()
++    print(f"     display manager: {dm or 'unknown'}")
++
++    devs = camera.list_video_devices()
++    logi = sorted({d for d, desc in devs.items() if desc and "logitech" in desc.lower()})
++    check("Logitech camera(s) detected", bool(logi), ", ".join(logi) if logi else "none found via v4l2-ctl")
++
++    rgb = cfg["camera"].get("rgb_device")
++    ir = cfg["camera"].get("ir_device")
++    check("RGB device configured", bool(rgb), rgb or "none -- run 'sudo facegate autosetup'")
++    check("IR device configured", bool(ir), ir or "none (RGB-only mode -- fine if your webcam has no IR sensor)")
++
++    username = os.environ.get("SUDO_USER") or getpass.getuser()
++    rgb_model = os.path.join(config.MODEL_DIR, f"{username}_rgb.yml")
++    ir_model = os.path.join(config.MODEL_DIR, f"{username}_ir.yml")
++    if rgb:
++        check(f"RGB model enrolled ({username})", os.path.exists(rgb_model))
++    if ir:
++        check(f"IR model enrolled ({username})", os.path.exists(ir_model))
++
++    for pam_file in PAM_TARGETS:
++        if not os.path.exists(pam_file):
++            print(f"[skip] PAM file not present: {pam_file} (not applicable on this system)")
++            continue
++        with open(pam_file) as f:
++            wired = PAM_MARKER in f.read()
++        check(f"PAM wired: {pam_file}", wired)
++
++    locked, remaining = security.is_locked_out()
++    check("not currently locked out", not locked, f"{remaining}s remaining" if locked else "")
++
++    try:
++        os.makedirs(logging_setup.LOG_DIR, exist_ok=True)
++        check("log directory writable", os.access(logging_setup.LOG_DIR, os.W_OK))
++    except PermissionError:
++        check("log directory writable", False)
++
++    print("\nAll checks passed." if ok_all else "\nSome checks failed -- see above.")
++
++
++def cmd_log(args):
++    """Show recent auth attempts from the FaceGate log file. New in v0.2.0."""
++    from . import logging_setup
++
++    try:
++        with open(logging_setup.LOG_FILE) as f:
++            lines = f.readlines()[-args.n :]
++    except FileNotFoundError:
++        print(f"No log file yet at {logging_setup.LOG_FILE}.")
++        print("Either nothing has run through PAM yet, or you're on syslog-only:")
++        print("  sudo journalctl -t facegate -e")
++        return
++    except PermissionError:
++        print(f"Permission denied reading {logging_setup.LOG_FILE} -- try with sudo.")
++        return
++    for line in lines:
++        print(line.rstrip())
++
++
++
+ def main():
+     parser = argparse.ArgumentParser(
+         prog="facegate",
+-        description="Face unlock for Logitech Brio webcams on Arch Linux (Howdy-style, RGB+IR).",
++        description="Face unlock for Logitech webcams on Arch Linux (Howdy-style, RGB+IR where available).",
+     )
++    parser.add_argument("--version", action="version", version=f"facegate {__version__}")
+     sub = parser.add_subparsers(dest="command", required=True)
+ 
+     sub.add_parser("autosetup", help="Detect camera, enroll your face, wire up PAM").set_defaults(
+@@ -448,6 +554,14 @@
+ 
+     sub.add_parser("uninstall", help="Remove PAM integration").set_defaults(func=cmd_uninstall)
+ 
++    sub.add_parser(
++        "doctor", help="Run health checks: camera, PAM wiring, enrolled models, lockout, logs"
++    ).set_defaults(func=cmd_doctor)
++
++    p = sub.add_parser("log", help="Show recent auth attempts from the FaceGate log")
++    p.add_argument("-n", type=int, default=20, help="number of lines to show (default 20)")
++    p.set_defaults(func=cmd_log)
++
+     args = parser.parse_args()
+     args.func(args)
+ 
+diff -ruN '--exclude=.git' a/facegate/config.py b/facegate/config.py
+--- a/facegate/config.py	2026-07-12 04:25:05.988980959 +0000
++++ b/facegate/config.py	2026-07-12 04:25:26.641496260 +0000
+@@ -17,6 +17,13 @@
+         "ir_device": None,
+         "auto_detected": False,
+     },
++    # Seconds to wait/retry for the camera devices to enumerate before
++    # giving up. USB webcams (especially ones behind a hub) don't always
++    # show up in v4l2-ctl the instant the kernel finishes booting, so a
++    # PAM check that runs right at the SDDM login screen after a cold
++    # boot can otherwise race the device and silently fail closed. New in
++    # v0.2.0.
++    "camera_wait_seconds": 5,
+     "recognition": {
+         # LBPH: LOWER confidence value = better match. These thresholds are
+         # conservative starting points; `facegate test` will show you real
+@@ -30,11 +37,29 @@
+         # `facegate set-attempts N`.
+         "max_attempts": 2,
+         "timeout_seconds": 8,
++        # Shorter budget used specifically for greeter/lock-screen PAM
++        # services (sddm, kde, kscreenlocker-greet). Those UIs read as
++        # "broken" if the screen just sits there for 16s (max_attempts x
++        # timeout_seconds) before a face check gives up, so lock-screen
++        # contexts get a tighter timeout than an interactive sudo prompt
++        # where you're already sitting there anyway. New in v0.2.0.
++        "timeout_seconds_greeter": 6,
+         # Minimum face bounding-box size (pixels) the Haar cascade will
+         # accept. Lower this if you're sitting far from the camera and
+         # enrollment/recognition can't find a face at all.
+         "min_face_size": 80,
+     },
++    # Brute-force / repeated-spoofing-attempt protection. After
++    # max_failed_attempts consecutive failures (across ALL PAM contexts,
++    # counted process-wide via /run/facegate/lockout.json), face auth is
++    # skipped for cooldown_seconds and PAM falls straight to password --
++    # not just for the current login attempt, but until the cooldown
++    # expires. State lives under /run (tmpfs) so a lockout doesn't
++    # survive a reboot. New in v0.2.0.
++    "lockout": {
++        "max_failed_attempts": 5,
++        "cooldown_seconds": 300,
++    },
+     "pin_hash": None,
+     "pin_salt": None,
+ }
+diff -ruN '--exclude=.git' a/facegate/logging_setup.py b/facegate/logging_setup.py
+--- a/facegate/logging_setup.py	1970-01-01 00:00:00.000000000 +0000
++++ b/facegate/logging_setup.py	2026-07-12 04:25:26.649534428 +0000
+@@ -0,0 +1,47 @@
++"""Rotating file logger for FaceGate, in addition to syslog.
++
++syslog is the source of truth (works even if /var/log is unwritable, e.g.
++read-only root), but journalctl -t facegate isn't discoverable for
++everyone, and it doesn't give you a simple `facegate log` view. This
++writes the same events to /var/log/facegate/facegate.log so `facegate log`
++has something to read directly, with rotation so it can't grow unbounded.
++
++New in v0.2.0.
++"""
++import logging
++import logging.handlers
++import os
++
++LOG_DIR = "/var/log/facegate"
++LOG_FILE = os.path.join(LOG_DIR, "facegate.log")
++
++_logger = None
++
++
++def get_logger(name="facegate"):
++    global _logger
++    if _logger is not None:
++        return _logger
++
++    logger = logging.getLogger(name)
++    logger.setLevel(logging.INFO)
++    logger.propagate = False
++
++    try:
++        os.makedirs(LOG_DIR, exist_ok=True)
++        os.chmod(LOG_DIR, 0o750)
++        handler = logging.handlers.RotatingFileHandler(
++            LOG_FILE, maxBytes=2_000_000, backupCount=5
++        )
++        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
++        logger.addHandler(handler)
++        if os.path.exists(LOG_FILE):
++            os.chmod(LOG_FILE, 0o640)
++    except (PermissionError, OSError):
++        # Not root, or /var/log/facegate isn't writable yet. Syslog (in
++        # pam_helper._log) remains the record of truth in that case -- this
++        # file log is a convenience, not the only copy.
++        logger.addHandler(logging.NullHandler())
++
++    _logger = logger
++    return logger
+diff -ruN '--exclude=.git' a/facegate/pam_helper.py b/facegate/pam_helper.py
+--- a/facegate/pam_helper.py	2026-07-12 04:25:05.997036422 +0000
++++ b/facegate/pam_helper.py	2026-07-12 04:25:26.644066040 +0000
+@@ -4,27 +4,68 @@
+ Exit code != 0 -> tell PAM to fall through to the next stack entry
+                   (normally the real password prompt).
+ 
+-pam_exec sets PAM_USER in the environment for the account being
+-authenticated, which is what we key the enrolled model off of.
++pam_exec sets PAM_USER (account being authenticated) and PAM_SERVICE
++(which PAM service triggered this -- "sudo", "login", "kde",
++"kscreenlocker-greet", "sddm", etc.) in the environment; we use both.
+ 
+ Every attempt is logged to syslog (facility LOG_AUTH, ident "facegate")
+-so a silent fall-through to password can actually be diagnosed after the
+-fact instead of just being a mystery exit code 1 -- check with:
++AND to /var/log/facegate/facegate.log (see logging_setup.py, new in
++v0.2.0) so a silent fall-through to password can actually be diagnosed
++after the fact instead of just being a mystery exit code 1:
+     sudo journalctl -t facegate -e
++    sudo facegate log
+ """
++import fcntl
+ import os
+ import sys
+ import syslog
++import time
+ 
+-from . import config, recognizer
++from . import camera, config, recognizer, security
++from .logging_setup import get_logger
+ 
++# PAM services where the person is looking at a lock/login screen right
++# now, as opposed to a sudo prompt in a terminal they're already sitting
++# at. Used to pick the shorter recognition.timeout_seconds_greeter budget
++# instead of the sudo-context timeout_seconds. New in v0.2.0.
++GREETER_SERVICES = {"sddm", "sddm-greeter", "kde", "kde-np", "kscreenlocker-greet"}
+ 
+-def _log(message):
++CAMERA_LOCK_FILE = "/run/facegate/camera.lock"
++
++
++def _log(message, level=syslog.LOG_INFO):
+     try:
+         syslog.openlog(ident="facegate", facility=syslog.LOG_AUTH)
+-        syslog.syslog(syslog.LOG_INFO, message)
++        syslog.syslog(level, message)
+     except Exception:
+         pass  # logging must never be the reason auth fails closed
++    try:
++        get_logger().info(message)
++    except Exception:
++        pass
++
++
++def _acquire_camera_lock(timeout=3.0):
++    """Serialize camera access across concurrent PAM invocations (e.g. a
++    sudo prompt and the lock screen both triggering a face check within
++    the same second). V4L2 devices generally only allow one exclusive
++    open at a time -- without this, the loser gets a confusing
++    "cannot open camera device" failure instead of a clean, explained
++    fallback to password. New in v0.2.0."""
++    try:
++        os.makedirs("/run/facegate", exist_ok=True)
++        fd = os.open(CAMERA_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
++    except OSError:
++        return None
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        try:
++            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            return fd
++        except BlockingIOError:
++            time.sleep(0.2)
++    os.close(fd)
++    return None
+ 
+ 
+ def main():
+@@ -37,15 +78,48 @@
+         _log("no PAM_USER in environment; falling back to password")
+         sys.exit(1)
+ 
++    service = os.environ.get("PAM_SERVICE", "unknown")
++
++    locked, remaining = security.is_locked_out()
++    if locked:
++        _log(f"user={username} service={service} SKIPPED: locked out, {remaining}s remaining")
++        sys.exit(1)
++
++    # Right after a cold boot (most relevant at the SDDM login screen) a
++    # USB webcam can take a moment to enumerate. Give it a few seconds
++    # before giving up, rather than failing closed on the very first try
++    # every time the machine restarts. New in v0.2.0.
++    if not camera.find_brio_devices():
++        camera.wait_for_devices(timeout=cfg.get("camera_wait_seconds", 5))
++
++    lock_fd = _acquire_camera_lock()
++    if lock_fd is None:
++        _log(f"user={username} service={service} SKIPPED: camera busy (concurrent check in progress)")
++        sys.exit(1)
++
++    timeout_override = None
++    if service in GREETER_SERVICES:
++        timeout_override = cfg["recognition"].get("timeout_seconds_greeter")
++
+     try:
+-        ok, info = recognizer.authenticate(username)
++        ok, info = recognizer.authenticate(username, timeout_override=timeout_override)
+     except Exception as e:
+         # Any camera/model error must fail closed, not crash PAM.
+-        _log(f"user={username} EXCEPTION during authenticate(): {type(e).__name__}: {e}")
++        _log(f"user={username} service={service} EXCEPTION during authenticate(): {type(e).__name__}: {e}")
++        security.record_failure()
+         sys.exit(1)
+-
+-    _log(f"user={username} result={'MATCH' if ok else 'NO MATCH'} info={info}")
+-    sys.exit(0 if ok else 1)
++    finally:
++        try:
++            fcntl.flock(lock_fd, fcntl.LOCK_UN)
++        finally:
++            os.close(lock_fd)
++
++    _log(f"user={username} service={service} result={'MATCH' if ok else 'NO MATCH'} info={info}")
++    if ok:
++        security.record_success()
++        sys.exit(0)
++    security.record_failure()
++    sys.exit(1)
+ 
+ 
+ if __name__ == "__main__":
+diff -ruN '--exclude=.git' a/facegate/recognizer.py b/facegate/recognizer.py
+--- a/facegate/recognizer.py	2026-07-12 04:25:05.997036422 +0000
++++ b/facegate/recognizer.py	2026-07-12 04:25:26.645745102 +0000
+@@ -258,10 +258,16 @@
+     return False, best_conf, detected_any
+ 
+ 
+-def authenticate(username):
++def authenticate(username, timeout_override=None):
+     """Run recognition against whichever streams are configured for this
+     user. Returns (bool success, info dict with raw confidences).
+ 
++    `timeout_override`, new in v0.2.0: lets callers (specifically
++    pam_helper, for greeter/lock-screen PAM services) use a shorter time
++    budget than the configured recognition.timeout_seconds, since a
++    lock-screen sitting unresponsive for the full sudo-context timeout
++    reads as broken rather than "still checking."
++
+     If both streams are required to match but one of them (either one)
+     never detected a face at all during the whole attempt window -- as
+     opposed to detecting a face and failing to match it -- the other
+@@ -275,13 +281,14 @@
+     cam = cfg["camera"]
+     rec = cfg["recognition"]
+     min_face_size = rec.get("min_face_size", 80)
++    timeout_seconds = timeout_override or rec["timeout_seconds"]
+ 
+     rgb_ok, rgb_conf, rgb_detected = _authenticate_stream(
+         cam.get("rgb_device"),
+         os.path.join(config.MODEL_DIR, f"{username}_rgb.yml"),
+         rec["confidence_threshold_rgb"],
+         rec["max_attempts"],
+-        rec["timeout_seconds"],
++        timeout_seconds,
+         min_face_size=min_face_size,
+     )
+     ir_ok, ir_conf, ir_detected = _authenticate_stream(
+@@ -289,7 +296,7 @@
+         os.path.join(config.MODEL_DIR, f"{username}_ir.yml"),
+         rec["confidence_threshold_ir"],
+         rec["max_attempts"],
+-        rec["timeout_seconds"],
++        timeout_seconds,
+         min_face_size=min_face_size,
+     )
+ 
+diff -ruN '--exclude=.git' a/facegate/security.py b/facegate/security.py
+--- a/facegate/security.py	2026-07-12 04:25:05.997036422 +0000
++++ b/facegate/security.py	2026-07-12 04:25:26.647950513 +0000
+@@ -15,16 +15,29 @@
+ `pam_unix.so` -- no face auth is ever added to it -- so this check can
+ only ever be satisfied by the real account password.
+ """
++import fcntl
+ import getpass
+ import hashlib
++import json
+ import os
+ import subprocess
++import time
+ 
+ from . import config
+ 
+ VERIFY_SERVICE_NAME = "facegate-verify"
+ VERIFY_SERVICE_FILE = f"/etc/pam.d/{VERIFY_SERVICE_NAME}"
+ 
++# Lockout state lives on tmpfs, not under /etc/facegate: it's meant to
++# reset on reboot (a lockout surviving a reboot just because someone was
++# fumbling with lighting last night is a worse user experience than the
++# security gain is worth), and it needs to be safely shared/locked across
++# concurrent PAM invocations (sudo + lock screen firing at once). New in
++# v0.2.0.
++LOCKOUT_DIR = "/run/facegate"
++LOCKOUT_STATE_FILE = os.path.join(LOCKOUT_DIR, "lockout.json")
++LOCKOUT_LOCK_FILE = os.path.join(LOCKOUT_DIR, "lockout.lock")
++
+ 
+ def ensure_verify_service():
+     """Create the dedicated password-only PAM service if it doesn't exist yet."""
+@@ -101,3 +114,88 @@
+         pin = getpass.getpass("Enter PIN: ")
+         return verify_pin(pin)
+     return False
++
++
++# ---------------------------------------------------------------------------
++# Lockout / cooldown (v0.2.0)
++#
++# Protects against repeated face-auth attempts (accidental or a deliberate
++# spoofing attempt) by tripping a cooldown after N consecutive failures,
++# during which PAM checks are skipped entirely and fall straight to
++# password. State is a tiny JSON file on tmpfs, guarded by a real flock so
++# concurrent PAM invocations (e.g. sudo in one terminal and the lock screen
++# both attempting a face check at once) can't race each other into an
++# inconsistent count.
++# ---------------------------------------------------------------------------
++
++
++def _with_lockout_lock(fn):
++    os.makedirs(LOCKOUT_DIR, exist_ok=True)
++    fd = os.open(LOCKOUT_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
++    try:
++        fcntl.flock(fd, fcntl.LOCK_EX)
++        return fn()
++    finally:
++        try:
++            fcntl.flock(fd, fcntl.LOCK_UN)
++        finally:
++            os.close(fd)
++
++
++def _load_lockout_state():
++    try:
++        with open(LOCKOUT_STATE_FILE) as f:
++            return json.load(f)
++    except (FileNotFoundError, json.JSONDecodeError):
++        return {"failures": 0, "locked_until": 0}
++
++
++def _save_lockout_state(state):
++    os.makedirs(LOCKOUT_DIR, exist_ok=True)
++    tmp = LOCKOUT_STATE_FILE + ".tmp"
++    with open(tmp, "w") as f:
++        json.dump(state, f)
++    os.replace(tmp, LOCKOUT_STATE_FILE)
++    try:
++        os.chmod(LOCKOUT_STATE_FILE, 0o600)
++    except PermissionError:
++        pass
++
++
++def record_failure():
++    """Bump the consecutive-failure counter; trip the cooldown if the
++    configured threshold is reached."""
++    cfg = config.load()
++    max_attempts = cfg.get("lockout", {}).get("max_failed_attempts", 5)
++    cooldown = cfg.get("lockout", {}).get("cooldown_seconds", 300)
++
++    def _do():
++        state = _load_lockout_state()
++        state["failures"] = state.get("failures", 0) + 1
++        if state["failures"] >= max_attempts:
++            state["locked_until"] = time.time() + cooldown
++            state["failures"] = 0
++        _save_lockout_state(state)
++
++    _with_lockout_lock(_do)
++
++
++def record_success():
++    """Reset the failure counter and clear any active cooldown."""
++    _with_lockout_lock(lambda: _save_lockout_state({"failures": 0, "locked_until": 0}))
++
++
++def is_locked_out():
++    """Return (bool locked, int seconds_remaining)."""
++    state = _load_lockout_state()
++    remaining = int(state.get("locked_until", 0) - time.time())
++    if remaining > 0:
++        return True, remaining
++    return False, 0
++
++
++def clear_lockout():
++    """Manually clear a cooldown (used by `sudo facegate enable`, so
++    re-enabling after tuning thresholds doesn't leave you locked out from
++    the tuning attempts themselves)."""
++    _with_lockout_lock(lambda: _save_lockout_state({"failures": 0, "locked_until": 0}))
+diff -ruN '--exclude=.git' a/install.sh b/install.sh
+--- a/install.sh	2026-07-12 04:25:05.997036422 +0000
++++ b/install.sh	2026-07-12 04:25:26.651141731 +0000
+@@ -46,6 +46,11 @@
+ EOF
+ chmod 755 /usr/bin/facegate-auth
+ 
++echo "== Creating log directory =="
++mkdir -p /var/log/facegate
++chmod 750 /var/log/facegate
++
+ echo ""
+-echo "Install complete."
++echo "Install complete (facegate $(python3 -c "import sys; sys.path.insert(0,'/usr/lib/facegate'); from facegate import __version__; print(__version__)"))."
+ echo "Run:  sudo facegate autosetup"
++echo "Then: sudo facegate doctor    (sanity-check camera + PAM wiring)"
+diff -ruN '--exclude=.git' a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml	2026-07-12 04:25:05.997036422 +0000
++++ b/pyproject.toml	2026-07-12 04:25:26.652878176 +0000
+@@ -4,8 +4,8 @@
+ 
+ [project]
+ name = "facegate"
+-version = "0.1.0"
+-description = "Face unlock (RGB+IR) for Logitech Brio webcams via PAM, Howdy-style."
++version = "0.2.0"
++description = "Face unlock (RGB+IR) for Logitech webcams via PAM, Howdy-style."
+ readme = "README.md"
+ requires-python = ">=3.10"
+ license = { text = "MIT" }

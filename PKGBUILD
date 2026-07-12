@@ -1,8 +1,8 @@
 # Maintainer: Ray0rf1re
 pkgname=facegate
-pkgver=0.1.1
+pkgver=0.2.0
 pkgrel=1
-pkgdesc="Face unlock (RGB+IR) for Logitech Brio webcams via PAM, Howdy-style"
+pkgdesc="Face unlock (RGB+IR) for Logitech webcams via PAM, Howdy-style"
 arch=('any')
 url="https://github.com/minerofthesoal/facegate"
 license=('MIT')

@@ -258,9 +258,15 @@ def _authenticate_stream(device_path, model_path, threshold, max_attempts, timeo
     return False, best_conf, detected_any
 
 
-def authenticate(username):
+def authenticate(username, timeout_override=None):
     """Run recognition against whichever streams are configured for this
     user. Returns (bool success, info dict with raw confidences).
+
+    `timeout_override`, new in v0.2.0: lets callers (specifically
+    pam_helper, for greeter/lock-screen PAM services) use a shorter time
+    budget than the configured recognition.timeout_seconds, since a
+    lock-screen sitting unresponsive for the full sudo-context timeout
+    reads as broken rather than "still checking."
 
     If both streams are required to match but one of them (either one)
     never detected a face at all during the whole attempt window -- as
@@ -275,13 +281,14 @@ def authenticate(username):
     cam = cfg["camera"]
     rec = cfg["recognition"]
     min_face_size = rec.get("min_face_size", 80)
+    timeout_seconds = timeout_override or rec["timeout_seconds"]
 
     rgb_ok, rgb_conf, rgb_detected = _authenticate_stream(
         cam.get("rgb_device"),
         os.path.join(config.MODEL_DIR, f"{username}_rgb.yml"),
         rec["confidence_threshold_rgb"],
         rec["max_attempts"],
-        rec["timeout_seconds"],
+        timeout_seconds,
         min_face_size=min_face_size,
     )
     ir_ok, ir_conf, ir_detected = _authenticate_stream(
@@ -289,7 +296,7 @@ def authenticate(username):
         os.path.join(config.MODEL_DIR, f"{username}_ir.yml"),
         rec["confidence_threshold_ir"],
         rec["max_attempts"],
-        rec["timeout_seconds"],
+        timeout_seconds,
         min_face_size=min_face_size,
     )
 
