@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "visagate"
+version = "0.2.4"
+description = "Face unlock (RGB+IR) for Logitech webcams via PAM, Howdy-style."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Blaze Industries Research" }]
+dependencies = [
+    "numpy>=1.24",
+    "python-pam>=2.0",
+    # opencv-contrib-python is intentionally NOT pinned here. On Arch, cv2.face
+    # comes from the pacman `opencv` package (see install.sh's cv2.face check);
+    # forcing opencv-contrib-python via pip on top of that can conflict. Install
+    # it yourself if you're on a non-Arch system without a package-manager cv2.
+]
+
+[project.scripts]
+visagate = "visagate.cli:main"
+visagate-auth = "visagate.pam_helper:main"
+
+[tool.setuptools.packages.find]
+include = ["visagate*"]
+
+[tool.setuptools.package-data]
+visagate = ["data/*.xml"]

@@ -1,0 +1,7 @@
+opencv-contrib-python>=4.8
+numpy>=1.24
+python-pam>=2.0
+# Optional -- only needed if you turn on `facegate hf-upload on`. Not
+# installed by default by install.sh; install it yourself if you want
+# that feature: pip install --break-system-packages huggingface_hub
+# huggingface_hub>=0.20
